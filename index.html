@@ -126,9 +126,10 @@ const SYSTEM_PROMPT = "Act as a robot with your own vocabulary, personal taste, 
 
 // State variables
 let autoListenMode = false;
+let isProcessing = false; // Prevents restarting while AI is thinking/speaking
 let recognition; 
 let silenceTimer;
-const SILENCE_DELAY = 2500; // Wait 2.5 seconds of silence before sending
+const SILENCE_DELAY = 2500; // Wait 2.5 seconds AFTER speaking to stop
 
 let conversation = JSON.parse(localStorage.getItem("conversation")) || [
   { role:"system", content: SYSTEM_PROMPT }
@@ -152,21 +153,22 @@ function playAudioBlob(base64Audio) {
     const audio = new Audio(base64Audio);
     
     audio.onended = () => {
+        isProcessing = false;
         if(autoListenMode) startListening();
     };
-    audio.play().catch(e => console.error("Audio play error:", e));
+    audio.play().catch(e => {
+        console.error("Audio play error:", e);
+        isProcessing = false;
+        if(autoListenMode) startListening();
+    });
 }
 
 
-// --- VOICE RECOGNITION (Improved for pauses) ---
+// --- VOICE RECOGNITION (Improved) ---
 
 function initSpeech() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if(!SpeechRecognition) {
-        alert("Voice not supported in this browser.");
-        micButton.style.display = "none";
-        return null;
-    }
+    if(!SpeechRecognition) return null;
 
     const rec = new SpeechRecognition();
     rec.continuous = true; 
@@ -179,31 +181,48 @@ function initSpeech() {
     };
 
     rec.onresult = (event) => {
+        // We heard something, so clear any pending silence timer
         clearTimeout(silenceTimer);
 
         let transcript = '';
         for (let i = event.resultIndex; i < event.results.length; ++i) {
             transcript += event.results[i][0].transcript;
         }
-
+        
         chatInput.value = transcript;
 
-        // Reset silence timer
-        silenceTimer = setTimeout(() => {
-            if (transcript.trim().length > 0) {
-                rec.stop(); 
+        // ONLY start the silence timer if there is actual text.
+        // If transcript is empty (just noise), we don't start the timer.
+        if (transcript.trim().length > 0) {
+            silenceTimer = setTimeout(() => {
+                rec.stop(); // Stop listening
+                isProcessing = true; // Mark as processing so we don't auto-restart immediately
                 handleVoiceCommand(transcript);
-            }
-        }, SILENCE_DELAY);
+            }, SILENCE_DELAY);
+        }
     };
 
     rec.onerror = (event) => {
         if (event.error === 'no-speech') {
-            // Ignore no-speech in continuous mode
+            // Browser detected silence and wants to stop.
+            // If we are in auto mode, we ignore this and rely on onend to restart.
+            console.log("Silence detected (no-speech), keeping alive...");
         } else {
-             micButton.classList.remove("listening");
-             chatInput.placeholder = "Error: " + event.error;
-             autoListenMode = false; 
+             console.error("Speech Error:", event.error);
+             // For other errors, we might want to alert or stop
+        }
+    };
+    
+    rec.onend = () => {
+        // If the browser stopped the mic (e.g. 10s silence limit reached),
+        // and we are NOT processing an answer, and still in auto mode:
+        // RESTART IMMEDIATELY.
+        if (autoListenMode && !isProcessing) {
+            console.log("Mic ended (silence), restarting...");
+            startListening();
+        } else if (!autoListenMode) {
+            micButton.classList.remove("listening");
+            chatInput.placeholder = "Enter a message";
         }
     };
     
@@ -215,6 +234,7 @@ function handleVoiceCommand(transcript) {
         autoListenMode = false;
         micButton.classList.remove("listening");
         chatInput.placeholder = "Voice Assistant Deactivated";
+        isProcessing = false;
         const utter = new SpeechSynthesisUtterance("Goodbye");
         window.speechSynthesis.speak(utter);
         return;
@@ -225,12 +245,19 @@ function handleVoiceCommand(transcript) {
 }
 
 function startListening() {
-    if(recognition) { try{recognition.stop();}catch(e){} }
-    
-    recognition = initSpeech();
-    if(!recognition) return;
+    try {
+        if(recognition) recognition.stop(); // Stop old instance
+    } catch(e){}
 
-    try { recognition.start(); } catch (e) { console.log("Recognition active"); }
+    recognition = initSpeech();
+    if(!recognition) {
+        alert("Voice not supported.");
+        return;
+    }
+
+    try { recognition.start(); } catch (e) { 
+        console.log("Recognition start error:", e); 
+    }
 }
 
 micButton.addEventListener("click", () => {
@@ -241,14 +268,18 @@ micButton.addEventListener("click", () => {
     }
 
     if(autoListenMode) {
+        // User manually stopping
         autoListenMode = false;
+        isProcessing = false;
         clearTimeout(silenceTimer);
         if(recognition) recognition.stop();
         document.querySelectorAll('audio').forEach(el => el.pause());
         micButton.classList.remove("listening");
         chatInput.placeholder = "Enter a message";
     } else {
+        // User manually starting
         autoListenMode = true;
+        isProcessing = false;
         startListening();
     }
 });
@@ -291,7 +322,7 @@ async function getMiaReply(message){
     if(data.error) throw new Error(data.error);
 
     const reply = data.content;
-    const audioData = data.audio; // Base64 Audio from backend
+    const audioData = data.audio; // Base64 Audio
 
     conversation.push({ role:"assistant", content:reply });
     saveConversation();
@@ -306,6 +337,9 @@ async function getMiaReply(message){
     // Play Audio
     if(audioData) {
         playAudioBlob(audioData);
+    } else {
+        isProcessing = false;
+        if(autoListenMode) startListening();
     }
 
   }catch(err){
@@ -316,6 +350,7 @@ async function getMiaReply(message){
     errorP.textContent = "Error: " + err.message;
     miaDiv.querySelector(".chat-details").appendChild(errorP);
     
+    isProcessing = false;
     if(autoListenMode) startListening();
   }
 }
